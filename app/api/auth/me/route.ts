@@ -1,24 +1,15 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { getSessionFromRequest } from '@/lib/auth'
 
-import { NextResponse } from 'next/server'
-import { getCurrentUser } from '@/lib/auth'
-import { supabaseAdmin } from '@/lib/supabase'
-
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
-    const userPayload = await getCurrentUser()
-    if (!userPayload) {
-      return NextResponse.json({ user: null }, { status: 401 })
+    const session = await getSessionFromRequest(req)
+    if (!session) {
+      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
     }
-
-    const { data: user } = await supabaseAdmin
-      .from('users')
-      .select('id, email, name, role, created_at')
-      .eq('id', userPayload.id)
-      .single()
-
-    return NextResponse.json({ user })
-  } catch (err: unknown) {
-    console.error('Get user error:', err)
+    return NextResponse.json({ user: session.user })
+  } catch (error) {
+    console.error('Me error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
