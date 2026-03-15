@@ -1,79 +1,92 @@
-
 import { NextRequest, NextResponse } from 'next/server'
-import { supabaseAdmin } from '@/lib/supabase'
-import { validateContactForm, sanitizeHtml } from '@/lib/validation'
-import { checkRateLimit, getRateLimitKey, RATE_LIMITS } from '@/lib/rateLimit'
+import { supabaseAdmin } from '@/lib/db'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { checkSpam } from '@/lib/spam-check'
 
 export async function POST(req: NextRequest) {
-  const key = getRateLimitKey(req, 'contact')
-  const rl = checkRateLimit(key, RATE_LIMITS.contact)
-  if (!rl.allowed) {
-    return NextResponse.json(
-      { error: 'Too many submissions. Please try again later.' },
-      { status: 429 }
-    )
-  }
-
   try {
-    const body = await req.json()
-    const { name, email, message, subject, honeypot } = body
-
-    // Validate
-    const validation = validateContactForm({ name, email, message, honeypot })
-    if (!validation.valid) {
-      return NextResponse.json({ error: validation.message }, { status: 400 })
+    const ip = req.ip || req.headers.get('x-forwarded-for') || 'unknown'
+    const rl = await checkRateLimit(ip, 'contact', 3, 60)
+    if (!rl.success) {
+      return NextResponse.json(
+        { error: 'Too many contact form submissions. Please try again later.' },
+        { status: 429 }
+      )
     }
 
-    const forwarded = req.headers.get('x-forwarded-for')
-    const ip = forwarded ? forwarded.split(',')[0].trim() : 'unknown'
+    const body = await req.json()
+    const { name, email, subject, message, honeypot, submittedAt } = body
 
-    // Store in database
-    const { data: submission, error } = await supabaseAdmin
+    if (!name || !email || !message) {
+      return NextResponse.json({ error: 'Name, email, and message are required' }, { status: 400 })
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return NextResponse.json({ error: 'Invalid email address' }, { status: 400 })
+    }
+    if (name.length > 100 || message.length > 5000) {
+      return NextResponse.json({ error: 'Input exceeds maximum length' }, { status: 400 })
+    }
+
+    const spamResult = checkSpam({ name, email, message, honeypot, submittedAt })
+
+    const { data: submission, error: dbError } = await supabaseAdmin
       .from('contact_submissions')
       .insert({
-        name: sanitizeHtml(name.trim()),
+        name: name.trim(),
         email: email.toLowerCase().trim(),
-        subject: subject ? sanitizeHtml(subject.trim()) : 'General Inquiry',
-        message: sanitizeHtml(message.trim()),
+        subject: subject?.trim() || null,
+        message: message.trim(),
         ip_address: ip,
-        status: 'new'
+        status: spamResult.isSpam ? 'spam' : 'new',
+        spam_score: spamResult.score
       })
       .select()
       .single()
 
-    if (error) throw error
+    if (dbError) throw dbError
 
-    // Send notification email via Supabase Edge Function (if configured)
-    const notifyEmail = process.env.NOTIFY_EMAIL
-    if (notifyEmail) {
-      try {
-        await supabaseAdmin.functions.invoke('send-notification', {
+    if (!spamResult.isSpam) {
+      // Send notification email via Supabase Edge Function or direct SMTP
+      const notificationEmail = process.env.NOTIFICATION_EMAIL
+      if (notificationEmail) {
+        await supabaseAdmin.functions.invoke('send-contact-notification', {
           body: {
-            to: notifyEmail,
-            subject: `New Contact Form: ${submission.subject}`,
-            html: `
-              <h2>New Contact Form Submission</h2>
-              <p><strong>Name:</strong> ${submission.name}</p>
-              <p><strong>Email:</strong> ${submission.email}</p>
-              <p><strong>Subject:</strong> ${submission.subject}</p>
-              <p><strong>Message:</strong></p>
-              <p>${submission.message.replace(/\n/g, '<br>')}</p>
-              <hr>
-              <p><small>Submitted at ${new Date().toISOString()} from IP ${ip}</small></p>
-            `
+            to: notificationEmail,
+            submission: { name, email, subject, message, id: submission.id }
           }
-        })
-      } catch (notifyErr) {
-        console.warn('Notification failed (non-fatal):', notifyErr)
+        }).catch(err => console.warn('Notification failed:', err))
       }
     }
 
     return NextResponse.json({
-      message: 'Your message has been sent successfully! We will get back to you soon.',
+      message: 'Thank you for your message! We will get back to you soon.',
       id: submission.id
     }, { status: 201 })
-  } catch (err: unknown) {
-    console.error('Contact form error:', err)
+  } catch (error) {
+    console.error('Contact form error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
+}
+
+export async function GET(req: NextRequest) {
+  try {
+    const { searchParams } = new URL(req.url)
+    const status = searchParams.get('status') || 'new'
+    const page = parseInt(searchParams.get('page') || '1')
+    const limit = Math.min(parseInt(searchParams.get('limit') || '20'), 100)
+    const offset = (page - 1) * limit
+
+    const { data, error, count } = await supabaseAdmin
+      .from('contact_submissions')
+      .select('*', { count: 'exact' })
+      .eq('status', status)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+
+    if (error) throw error
+    return NextResponse.json({ submissions: data, total: count, page })
+  } catch (error) {
+    console.error('Contact list error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
